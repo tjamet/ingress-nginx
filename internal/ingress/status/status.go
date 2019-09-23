@@ -17,7 +17,9 @@ limitations under the License.
 package status
 
 import (
+	"bytes"
 	"fmt"
+	"html/template"
 	"net"
 	"sort"
 	"strings"
@@ -62,6 +64,8 @@ type Config struct {
 
 	PublishService string
 
+	PublishServiceSelector string
+
 	PublishStatusAddress string
 
 	UpdateStatusOnShutdown bool
@@ -81,6 +85,7 @@ type Config struct {
 type statusSync struct {
 	Config
 
+	publishServiceSelectorTemplate *template.Template
 	// pod contains runtime information about this pod
 	pod *k8s.PodInfo
 
@@ -116,25 +121,7 @@ func (s statusSync) Shutdown() {
 
 	klog.Info("updating status of Ingress rules (remove)")
 
-	addrs, err := s.runningAddresses()
-	if err != nil {
-		klog.Errorf("error obtaining running IPs: %v", addrs)
-		return
-	}
-
-	if len(addrs) > 1 {
-		// leave the job to the next leader
-		klog.Infof("leaving status update for next leader (%v)", len(addrs))
-		return
-	}
-
-	if s.isRunningMultiplePods() {
-		klog.V(2).Infof("skipping Ingress status update (multiple pods running - another one will be elected as master)")
-		return
-	}
-
-	klog.Infof("removing address from ingress status (%v)", addrs)
-	s.updateStatus([]apiv1.LoadBalancerIngress{})
+	s.updateStatus(true)
 }
 
 func (s *statusSync) sync(key interface{}) error {
@@ -143,12 +130,7 @@ func (s *statusSync) sync(key interface{}) error {
 		return nil
 	}
 
-	addrs, err := s.runningAddresses()
-	if err != nil {
-		return err
-	}
-	s.updateStatus(sliceToStatus(addrs))
-
+	s.updateStatus(false)
 	return nil
 }
 
@@ -157,26 +139,53 @@ func (s statusSync) keyfunc(input interface{}) (interface{}, error) {
 }
 
 // NewStatusSyncer returns a new Syncer instance
-func NewStatusSyncer(podInfo *k8s.PodInfo, config Config) Syncer {
+func NewStatusSyncer(podInfo *k8s.PodInfo, config Config) (Syncer, error) {
+	var tpl *template.Template
+	var err error
+	if config.PublishServiceSelector != "" {
+		tpl, err = template.New("service-selector").Parse(config.PublishServiceSelector)
+		if err != nil {
+			return nil, err
+		}
+	}
 	st := statusSync{
 		pod: podInfo,
+
+		publishServiceSelectorTemplate: tpl,
 
 		Config: config,
 	}
 	st.syncQueue = task.NewCustomTaskQueue(st.sync, st.keyfunc)
 
-	return st
+	return st, nil
 }
 
 // runningAddresses returns a list of IP addresses and/or FQDN where the
 // ingress controller is currently running
-func (s *statusSync) runningAddresses() ([]string, error) {
+func (s *statusSync) runningAddresses(ing *ingress.Ingress) ([]string, error) {
 	if s.PublishStatusAddress != "" {
 		return []string{s.PublishStatusAddress}, nil
 	}
 
 	if s.PublishService != "" {
-		return statusAddressFromService(s.PublishService, s.Client)
+		svc, err := getServiceFromName(s.PublishService, s.Client)
+		if err != nil {
+			return nil, err
+		}
+		return statusAddressFromService(svc)
+	}
+
+	if s.PublishServiceSelector != "" {
+		d := bytes.NewBuffer(nil)
+		err := s.publishServiceSelectorTemplate.Execute(d, ing.Ingress)
+		if err != nil {
+			return nil, err
+		}
+		svc, err := getServiceFromSelector(d.String(), s.Client)
+		if err != nil {
+			return nil, err
+		}
+		return statusAddressFromService(svc)
 	}
 
 	// get information about all the pods running the ingress controller
@@ -233,17 +242,39 @@ func sliceToStatus(endpoints []string) []apiv1.LoadBalancerIngress {
 }
 
 // updateStatus changes the status information of Ingress rules
-func (s *statusSync) updateStatus(newIngressPoint []apiv1.LoadBalancerIngress) {
+func (s *statusSync) updateStatus(shutdown bool) {
 	ings := s.IngressLister.ListIngresses(nil)
 
 	p := pool.NewLimited(10)
 	defer p.Close()
 
 	batch := p.Batch()
-	sort.SliceStable(newIngressPoint, lessLoadBalancerIngress(newIngressPoint))
 
 	for _, ing := range ings {
 		curIPs := ing.Status.LoadBalancer.Ingress
+		newIngressPoint := []apiv1.LoadBalancerIngress{}
+		addrs, err := s.runningAddresses(ing)
+		if err != nil {
+			klog.Errorf("error obtaining running IPs: %v", addrs)
+			continue
+		}
+		if shutdown {
+			if len(addrs) > 1 {
+				// leave the job to the next leader
+				klog.Infof("leaving status update for next leader (%v)", len(addrs))
+				continue
+			}
+
+			if s.isRunningMultiplePods() {
+				klog.V(2).Infof("skipping Ingress status update (multiple pods running - another one will be elected as master)")
+				continue
+			}
+
+			klog.Infof("removing address from ingress status (%v)", addrs)
+		} else {
+			newIngressPoint = sliceToStatus(addrs)
+			sort.SliceStable(newIngressPoint, lessLoadBalancerIngress(newIngressPoint))
+		}
 		sort.SliceStable(curIPs, lessLoadBalancerIngress(curIPs))
 		if ingressSliceEqual(curIPs, newIngressPoint) {
 			klog.V(3).Infof("skipping update of Ingress %v/%v (no change)", ing.Namespace, ing.Name)
@@ -325,11 +356,37 @@ func ingressSliceEqual(lhs, rhs []apiv1.LoadBalancerIngress) bool {
 	return true
 }
 
-func statusAddressFromService(service string, kubeClient clientset.Interface) ([]string, error) {
+func getServiceFromName(service string, kubeClient clientset.Interface) (*apiv1.Service, error) {
 	ns, name, _ := k8s.ParseNameNS(service)
-	svc, err := kubeClient.CoreV1().Services(ns).Get(name, metav1.GetOptions{})
+
+	return kubeClient.CoreV1().Services(ns).Get(name, metav1.GetOptions{})
+}
+
+func getServiceFromSelector(nsLabelselector string, kubeClient clientset.Interface) (*apiv1.Service, error) {
+	nsSelector := strings.SplitN(nsLabelselector, "/", 2)
+	if len(nsSelector) != 2 {
+		return nil, fmt.Errorf("invalid format (namespace/name) found in '%v'", nsLabelselector)
+	}
+	ns := nsSelector[0]
+	selector := nsSelector[1]
+	list, err := kubeClient.CoreV1().Services(ns).List(metav1.ListOptions{
+		LabelSelector: selector,
+	})
 	if err != nil {
 		return nil, err
+	}
+	if len(list.Items) > 1 {
+		return nil, fmt.Errorf("Ambiguous service selector, returned %d services", len(list.Items))
+	}
+	if len(list.Items) == 1 {
+		return &list.Items[0], nil
+	}
+	return nil, nil
+}
+
+func statusAddressFromService(svc *apiv1.Service) ([]string, error) {
+	if svc == nil {
+		return []string{}, nil
 	}
 
 	switch svc.Spec.Type {
@@ -354,5 +411,5 @@ func statusAddressFromService(service string, kubeClient clientset.Interface) ([
 		return addresses, nil
 	}
 
-	return nil, fmt.Errorf("unable to extract IP address/es from service %v", service)
+	return nil, fmt.Errorf("unable to extract IP address/es from service %s/%s", svc.Namespace, svc.Name)
 }

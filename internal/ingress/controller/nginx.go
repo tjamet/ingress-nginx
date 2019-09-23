@@ -138,14 +138,18 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	n.syncQueue = task.NewTaskQueue(n.syncIngress)
 
 	if config.UpdateStatus {
-		n.syncStatus = status.NewStatusSyncer(pod, status.Config{
+		n.syncStatus, err = status.NewStatusSyncer(pod, status.Config{
 			Client:                 config.Client,
 			PublishService:         config.PublishService,
+			PublishServiceSelector: config.PublishServiceSelector,
 			PublishStatusAddress:   config.PublishStatusAddress,
 			IngressLister:          n.store,
 			UpdateStatusOnShutdown: config.UpdateStatusOnShutdown,
 			UseNodeInternalIP:      config.UseNodeInternalIP,
 		})
+		if err != nil {
+			klog.Fatalf("unexpected error creating the status syncer: %v", err)
+		}
 	} else {
 		klog.Warning("Update of Ingress status is disabled (flag --update-status)")
 	}

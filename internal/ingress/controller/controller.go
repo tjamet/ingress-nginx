@@ -68,8 +68,9 @@ type Configuration struct {
 	DefaultSSLCertificate string
 
 	// +optional
-	PublishService       string
-	PublishStatusAddress string
+	PublishService         string
+	PublishStatusAddress   string
+	PublishServiceSelector string
 
 	UpdateStatus           bool
 	UseNodeInternalIP      bool

@@ -35,6 +35,19 @@ import (
 	"k8s.io/ingress-nginx/internal/nginx"
 )
 
+func maxOneProvided(vals ...string) bool {
+	found := false
+	for _, val := range vals {
+		if val != "" {
+			if found {
+				return false
+			}
+			found = true
+		}
+	}
+	return true
+}
+
 func parseFlags() (bool, *controller.Configuration, error) {
 	var (
 		flags = pflag.NewFlagSet("", pflag.ExitOnError)
@@ -64,6 +77,12 @@ All ingress classes are satisfied if this parameter is left empty.`)
 			`Service fronting the Ingress controller.
 Takes the form "namespace/name". When used together with update-status, the
 controller mirrors the address of this service's endpoints to the load-balancer
+status of all Ingress objects it satisfies.`)
+
+		publishSvcSelector = flags.String("publish-service-selector", "",
+			`Selector (label query) to filter on for the service fronting the Ingress controller.
+Takes the form of a golang template "namespace/labelName={{.Metadata.Annotations["prefix/suffix"]}}", generating "namespace/labelName=labelValue". When used together with update-status, the
+controller mirrors the address of the endpoints of the service matching the labels to the load-balancer
 status of all Ingress objects it satisfies.`)
 
 		tcpConfigMapName = flags.String("tcp-services-configmap", "",
@@ -223,8 +242,8 @@ Takes the form "<host>:port". If not provided, no admission controller is starte
 		klog.Warningf("SSL certificate chain completion is disabled (--enable-ssl-chain-completion=false)")
 	}
 
-	if *publishSvc != "" && *publishStatusAddress != "" {
-		return false, nil, fmt.Errorf("flags --publish-service and --publish-status-address are mutually exclusive")
+	if !maxOneProvided(*publishSvc, *publishStatusAddress, *publishSvcSelector) {
+		return false, nil, fmt.Errorf("flags --publish-service, --publish-status-address and --publish-service-selector are mutually exclusive")
 	}
 
 	nginx.HealthPath = *defHealthzURL
@@ -252,6 +271,7 @@ Takes the form "<host>:port". If not provided, no admission controller is starte
 		UDPConfigMapName:       *udpConfigMapName,
 		DefaultSSLCertificate:  *defSSLCertificate,
 		PublishService:         *publishSvc,
+		PublishServiceSelector: *publishSvcSelector,
 		PublishStatusAddress:   *publishStatusAddress,
 		UpdateStatusOnShutdown: *updateStatusOnShutdown,
 		UseNodeInternalIP:      *useNodeInternalIP,

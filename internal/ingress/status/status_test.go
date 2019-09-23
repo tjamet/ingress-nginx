@@ -115,6 +115,10 @@ func buildSimpleClientSet() *testclient.Clientset {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "foo",
 					Namespace: apiv1.NamespaceDefault,
+					Labels:    map[string]string{"matched_label": "value"},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeLoadBalancer,
 				},
 				Status: apiv1.ServiceStatus{
 					LoadBalancer: apiv1.LoadBalancerStatus{
@@ -126,6 +130,20 @@ func buildSimpleClientSet() *testclient.Clientset {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "foo_non_exist",
 					Namespace: apiv1.NamespaceDefault,
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "foo_non_exist_duplicated_label_1",
+					Namespace: "ns1",
+					Labels:    map[string]string{"key": "value"},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "foo_non_exist_duplicated_label_2",
+					Namespace: "ns1",
+					Labels:    map[string]string{"key": "value"},
 				},
 			},
 		}},
@@ -200,7 +218,7 @@ func buildExtensionsIngresses() []networking.Ingress {
 		{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "foo_ingress_different_class",
-				Namespace: metav1.NamespaceDefault,
+				Namespace: apiv1.NamespaceDefault,
 				Annotations: map[string]string{
 					class.IngressKey: "no-nginx",
 				},
@@ -280,6 +298,76 @@ func buildStatusSync() statusSync {
 	}
 }
 
+func TestLabelSyncer(t *testing.T) {
+
+	// make sure election can be created
+	os.Setenv("POD_NAME", "foo1")
+	os.Setenv("POD_NAMESPACE", apiv1.NamespaceDefault)
+	c := Config{
+		Client:                 buildSimpleClientSet(),
+		PublishServiceSelector: "namespace/{{",
+		IngressLister:          buildIngressLister(),
+		UpdateStatusOnShutdown: true,
+	}
+
+	// create object
+	fkSync, err := NewStatusSyncer(&k8s.PodInfo{
+		Name:      "foo_base_pod",
+		Namespace: apiv1.NamespaceDefault,
+		Labels: map[string]string{
+			"lable_sig": "foo_pod",
+		},
+	}, c)
+	if err == nil {
+		t.Errorf("expected an error")
+	}
+	if fkSync != nil {
+		t.Fatalf("expected a nil pointer")
+	}
+
+	c.PublishServiceSelector = apiv1.NamespaceDefault + `/matched_label={{ index .ObjectMeta.Annotations "matched_annotation" }}`
+
+	// create object
+	fkSync, err = NewStatusSyncer(&k8s.PodInfo{
+		Name:      "foo_base_pod",
+		Namespace: apiv1.NamespaceDefault,
+		Labels: map[string]string{
+			"lable_sig": "foo_pod",
+		},
+	}, c)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if fkSync == nil {
+		t.Fatalf("expected a valid Sync")
+	}
+	sSync := fkSync.(statusSync)
+	addrs, err := sSync.runningAddresses(&ingress.Ingress{})
+
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("when there is no annotation match, addresses should be empty")
+	}
+	addrs, err = sSync.runningAddresses(&ingress.Ingress{
+		Ingress: networking.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					"matched_annotation": "value",
+				},
+			},
+		},
+	})
+
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if len(addrs) != 4 {
+		t.Errorf("the annotation matches, all IPs should be returned, got %v", addrs)
+	}
+}
+
 func TestStatusActions(t *testing.T) {
 	// make sure election can be created
 	os.Setenv("POD_NAME", "foo1")
@@ -292,13 +380,16 @@ func TestStatusActions(t *testing.T) {
 	}
 
 	// create object
-	fkSync := NewStatusSyncer(&k8s.PodInfo{
+	fkSync, err := NewStatusSyncer(&k8s.PodInfo{
 		Name:      "foo_base_pod",
 		Namespace: apiv1.NamespaceDefault,
 		Labels: map[string]string{
 			"lable_sig": "foo_pod",
 		},
 	}, c)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
 	if fkSync == nil {
 		t.Fatalf("expected a valid Sync")
 	}
@@ -348,7 +439,7 @@ func TestStatusActions(t *testing.T) {
 
 	oic, err := fk.Client.NetworkingV1beta1().Ingresses(metav1.NamespaceDefault).Get("foo_ingress_different_class", metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("unexpected error")
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if oic.Status.LoadBalancer.Ingress[0].IP != "0.0.0.0" && oic.Status.LoadBalancer.Ingress[0].Hostname != "foo.bar.com" {
 		t.Fatalf("invalid ingress status for rule with different class")
@@ -505,7 +596,7 @@ func TestRunningAddresessWithPublishService(t *testing.T) {
 			fk := buildStatusSync()
 			fk.Config.Client = tc.fakeClient
 
-			ra, err := fk.runningAddresses()
+			ra, err := fk.runningAddresses(nil)
 			if err != nil {
 				if tc.errExpected {
 					return
@@ -529,7 +620,7 @@ func TestRunningAddresessWithPods(t *testing.T) {
 	fk := buildStatusSync()
 	fk.PublishService = ""
 
-	r, _ := fk.runningAddresses()
+	r, _ := fk.runningAddresses(nil)
 	if r == nil {
 		t.Fatalf("returned nil but expected valid []string")
 	}
@@ -543,11 +634,38 @@ func TestRunningAddresessWithPods(t *testing.T) {
 	}
 }
 
+func TestGetServiceFromSelector(t *testing.T) {
+	svc, err := getServiceFromSelector("ns1/key=value", buildSimpleClientSet())
+	if err == nil {
+		t.Errorf("when multiple services matches, an error should be returned")
+	}
+	if svc != nil {
+		t.Errorf("when multiple services matches, a nil service should be returned")
+	}
+	svc, err = getServiceFromSelector("ns1/key=other-value", buildSimpleClientSet())
+	if err != nil {
+		t.Errorf("when no service matches, no error should be returned, got: %v", err)
+	}
+	if svc != nil {
+		t.Errorf("when no service matches, a nil service should be returned")
+	}
+	svc, err = getServiceFromSelector(apiv1.NamespaceDefault+"/matched_label=value", buildSimpleClientSet())
+	if err != nil {
+		t.Errorf("when one service matches, no error should be returned, got: %v", err)
+	}
+	if svc == nil {
+		t.Fatalf("when one service matches, it should be returned")
+	}
+	if svc.Name != "foo" {
+		t.Fatalf("when one service matches, it should be returned, expecting 'foo', got '%s'", svc.Name)
+	}
+}
+
 func TestRunningAddresessWithPublishStatusAddress(t *testing.T) {
 	fk := buildStatusSync()
 	fk.PublishStatusAddress = "127.0.0.1"
 
-	ra, _ := fk.runningAddresses()
+	ra, _ := fk.runningAddresses(nil)
 	if ra == nil {
 		t.Fatalf("returned nil but expected valid []string")
 	}
